@@ -1,0 +1,135 @@
+name: VPS with Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [create-vps]
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+    - name: 📥 Checkout
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GH_TOKEN }}
+
+    - name: 🖥️ Setup TightVNC
+      shell: pwsh
+      run: |
+        Write-Host "📥 Downloading TightVNC..."
+        Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi" -OutFile "tightvnc.msi" -TimeoutSec 60
+        
+        Write-Host "⚙️ Installing TightVNC..."
+        Start-Process msiexec.exe -Wait -ArgumentList '/i', 'tightvnc.msi', '/quiet', '/norestart', 'ADDLOCAL="Server"', 'SERVER_REGISTER_AS_SERVICE=1', 'SERVER_ADD_FIREWALL_EXCEPTION=1', 'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1', 'SET_PASSWORD=1', 'VALUE_OF_PASSWORD=vpsbot123', 'SET_ACCEPTHTTPCONNECTIONS=1', 'VALUE_OF_ACCEPTHTTPCONNECTIONS=1', 'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1'
+        
+        Write-Host "🚀 Starting TightVNC server..."
+        Start-Process -FilePath "C:\\Program Files\\TightVNC\\tvnserver.exe" -ArgumentList "-run" -WindowStyle Hidden
+        Start-Sleep -Seconds 30
+        
+        netsh advfirewall firewall add rule name="VNC" dir=in action=allow protocol=TCP localport=5900
+        netsh advfirewall firewall add rule name="noVNC" dir=in action=allow protocol=TCP localport=6080
+        Write-Host "✅ VNC server started"
+
+    - name: 🌐 Setup noVNC
+      shell: pwsh
+      run: |
+        Write-Host "📦 Installing Python packages..."
+        python -m pip install --upgrade pip --quiet
+        pip install novnc websockify==0.13.0 --quiet
+        
+        Write-Host "🔍 Finding noVNC path..."
+        $novncPath = (pip show novnc | Select-String "Location:").ToString().Split()[-1] + "\\novnc"
+        
+        if (-not (Test-Path "$novncPath/vnc.html")) {
+          Write-Host "📥 Downloading noVNC from GitHub..."
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "noVNC.zip" -TimeoutSec 60
+          Expand-Archive -Path "noVNC.zip" -DestinationPath "." -Force
+          Move-Item -Path "noVNC-1.4.0" -Destination "noVNC" -Force
+          $novncPath = "noVNC"
+        }
+        
+        Write-Host "🚀 Starting websockify..."
+        Start-Process python -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath" -WindowStyle Hidden
+        Start-Sleep -Seconds 15
+        Write-Host "✅ noVNC started"
+
+    - name: ☁️ Setup Cloudflare Tunnel
+      shell: pwsh
+      run: |
+        Write-Host "📥 Downloading Cloudflared..."
+        Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe" -TimeoutSec 60
+        
+        Write-Host "🚀 Starting Cloudflare tunnel..."
+        Start-Process .\\cloudflared.exe -ArgumentList "tunnel", "--url", "http://localhost:6080", "--logfile", "cloudflared.log" -WindowStyle Hidden
+        Start-Sleep -Seconds 40
+        
+        Write-Host "🔍 Getting tunnel URL..."
+        $cloudflaredUrl = ""
+        for($i=0; $i -lt 60; $i++) {
+          if(Test-Path cloudflared.log) {
+            $log = Get-Content cloudflared.log -Raw
+            if($log -match 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com') {
+              $cloudflaredUrl = $matches[0]
+              Write-Host "✅ Found URL: $cloudflaredUrl"
+              break
+            }
+          }
+          Start-Sleep -Seconds 3
+        }
+        
+        if($cloudflaredUrl) {
+          $vncUrl = "$cloudflaredUrl/vnc.html"
+          $vncUrl | Out-File -FilePath vps-link.txt -NoNewline
+          
+          git config user.email "bot@vps.local"
+          git config user.name "VPS Bot"
+          git add vps-link.txt
+          git commit -m "🔗 VPS Ready" --allow-empty
+          git push origin main
+          
+          Write-Host ""
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "✅ VPS IS READY!" -ForegroundColor Green
+          Write-Host "🔗 URL: $vncUrl" -ForegroundColor Cyan
+          Write-Host "🔑 Password: vpsbot123" -ForegroundColor Yellow
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        } else {
+          Write-Host "❌ Failed to get tunnel URL"
+          exit 1
+        }
+
+    - name: ⏱️ Keep VPS Running
+      shell: pwsh
+      run: |
+        Write-Host "🟢 VPS Running - 330 minutes (5.5 hours)"
+        for($i=1; $i -le 330; $i++) {
+          Write-Host "⏱️ Minute $i/330 - $(Get-Date -Format 'HH:mm:ss')"
+          Start-Sleep -Seconds 60
+        }
+        Write-Host "⏰ Session completed"
+
+    - name: 🔄 Auto Restart
+      if: always()
+      shell: pwsh
+      run: |
+        Write-Host "🔄 Triggering auto restart..."
+        $headers = @{
+          "Authorization" = "Bearer ${{ secrets.GH_TOKEN }}"
+          "Accept" = "application/vnd.github+json"
+        }
+        $body = @{
+          event_type = "create-vps"
+          client_payload = @{ restart = $true }
+        } | ConvertTo-Json
+        
+        try {
+          Invoke-RestMethod -Uri "https://api.github.com/repos/helloticc/vps-1767341699255/dispatches" -Method Post -Headers $headers -Body $body -TimeoutSec 30
+          Write-Host "✅ Restart triggered"
+        } catch {
+          Write-Host "⚠️ Restart failed: $_"
+        }
