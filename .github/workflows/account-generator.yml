@@ -36,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         job_index: ${{ fromJson(needs.setup.outputs.job_indices) }}
-    
+
     env:
       TOTAL_AMOUNT: ${{ github.event.inputs.amount }}
       TOTAL_THREADS: ${{ github.event.inputs.threads }}
@@ -56,7 +56,6 @@ jobs:
       run: |
         cat << 'EOF' > runner.js
         const axios = require('axios');
-        const { v4: uuidv4 } = require('uuid');
         const fs = require('fs').promises;
 
         class DuolingoBot {
@@ -102,6 +101,7 @@ jobs:
             }
             async sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
             async createUnclaimedAccount() {
+                const { v4: uuidv4 } = await import('uuid');
                 const headers = { 'accept': 'application/json', 'user-agent': this.generateMobileUserAgent() };
                 const payload = { currentCourseId: 'DUOLINGO_FR_EN', distinctId: uuidv4(), fromLanguage: 'en' };
                 const response = await axios.post(`https://android-api-cf.duolingo.com/2023-05-23/users`, payload, { headers, params: { fields: 'id,creationDate' } });
@@ -148,7 +148,7 @@ jobs:
             } catch (error) { console.error(`Error creating account: ${error.message || error}`); return null; }
         }
         async function main() {
-            const [amountStr, filename] = process.argv.slice(2);
+            const [amountStr, filename, jobIndex] = process.argv.slice(2);
             const amount = parseInt(amountStr, 10);
             const bot = new DuolingoBot(); let accounts = [];
             console.log(`Starting generation of ${amount} accounts...`);
@@ -160,6 +160,12 @@ jobs:
             }
             console.log(`Writing ${accounts.length} created accounts to ${filename}`);
             await fs.writeFile(filename, JSON.stringify(accounts, null, 2));
+
+            const jwts = accounts.map(acc => acc.jwt).join('\n');
+            const jwt_filename = `jwts_${jobIndex}.txt`;
+            await fs.writeFile(jwt_filename, jwts);
+            console.log(`Writing ${accounts.length} JWTs to ${jwt_filename}`);
+
             console.log('Done.');
         }
         main();
@@ -174,17 +180,20 @@ jobs:
         fi
         if [ $ACCOUNTS_PER_JOB -gt 0 ]; then
           echo "This job will generate $ACCOUNTS_PER_JOB accounts."
-          node runner.js $ACCOUNTS_PER_JOB "output_${JOB_INDEX}.json"
+          node runner.js $ACCOUNTS_PER_JOB "output_${JOB_INDEX}.json" $JOB_INDEX
         else
           echo "No accounts to generate for this job."
           echo "[]" > "output_${JOB_INDEX}.json"
+          touch "jwts_${JOB_INDEX}.txt"
         fi
-    
-    - name: Upload partial result
+
+    - name: Upload partial results
       uses: actions/upload-artifact@v4
       with:
         name: accounts-part-${{ matrix.job_index }}
-        path: output_${{ matrix.job_index }}.json
+        path: |
+          output_${{ matrix.job_index }}.json
+          jwts_${{ matrix.job_index }}.txt
 
   combine:
     needs: generate
@@ -198,15 +207,24 @@ jobs:
         with:
           path: artifacts
 
-      - name: Combine results
+      - name: Combine JSON results
         run: |
           echo "Combining results into ${{ github.event.inputs.filename }}"
           jq -s 'add' artifacts/accounts-part-*/output_*.json > ${{ github.event.inputs.filename }}
           echo "Final file content:"
           cat ${{ github.event.inputs.filename }}
 
-      - name: Upload final file
+      - name: Combine JWT results
+        run: |
+          echo "Combining JWTs into jwts.txt"
+          cat artifacts/accounts-part-*/jwts_*.txt > jwts.txt
+          echo "Final JWTs:"
+          cat jwts.txt
+
+      - name: Upload final files
         uses: actions/upload-artifact@v4
         with:
-          name: final-accounts
-          path: ${{ github.event.inputs.filename }}
+          name: final-results
+          path: |
+            ${{ github.event.inputs.filename }}
+            jwts.txt
